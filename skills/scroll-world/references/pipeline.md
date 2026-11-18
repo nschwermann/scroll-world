@@ -1,306 +1,381 @@
-# Pipeline: copy-paste scripts (bash 3.2 safe)
+# Pipeline: copy-paste scripts (Replicate, bash 3.2 safe)
 
-Set these once. `NAMES` is the ordered section ids; the last is the hero/finale.
+Every generation goes through the Replicate HTTP API with `curl` + `jq` — no CLI, one
+token. Put the setup block and the functions you need into ONE `#!/bin/bash` script
+and run it with `bash script.sh` (never paste array loops into zsh — 1-indexed arrays,
+see gotchas.md). Generations take minutes: launch scripts **in the background** and poll
+their log; never block the foreground.
+
+## 0. Setup
 
 ```bash
-WORK=/tmp/scroll-world           # scratch dir for prompts, sources, frames
+WORK=/tmp/scroll-world           # scratch dir: prompts, sources, frames, run state
 ASSETS=./assets                  # where the site reads stills (webp) + clips (mp4)
 mkdir -p "$WORK" "$ASSETS/vid"
 NAMES="farm kitchen shop delivery plaza finale"   # <-- your section ids, in order
 
+: "${REPLICATE_API_TOKEN:?export REPLICATE_API_TOKEN first (SKILL Step 0)}"
+API=https://api.replicate.com/v1
+
 # Chain video model — ONE for every chained clip (SKILL Step 4 roster).
-# Must accept --start-image AND --end-image (verify: higgsfield model get <model>):
-# seedance_2_0 | kling3_0 | seedance_2_0_mini (draft tier). Reference-only models can't
-# hold a seam; models without --mode (e.g. kling3_0_turbo) need their own flag branch below.
-# DEFAULT backend: Monid pay-per-clip (§7 — gen_dive_monid/gen_conn_monid with
-# VRES=1080p|720p|480p instead of VOPTS). The gen_dive/gen_conn functions in §2/§4
-# below are the Higgsfield-credits FALLBACK (and the only home of kling3_0/mini).
-VMODEL=seedance_2_0
-case "$VMODEL" in                                  # per-model flags + durations (bash 3.2 safe)
-  kling3_0)          VOPTS="--mode std --sound off";          DIVE_DUR=10; CONN_DUR=5 ;;  # no --resolution param on Kling
-  seedance_2_0_mini) VOPTS="--mode std --resolution 720p";    DIVE_DUR=8;  CONN_DUR=5 ;;  # cheap frame-locked previz
-  *)                 VOPTS="--mode std --resolution 1080p";   DIVE_DUR=8;  CONN_DUR=5 ;;  # seedance_2_0 default
-esac
+VMODEL=bytedance/seedance-2.0    # default; the moderation fallback is kwaivgi/kling-v3-video
+VRES=1080p                       # 480p = previz, 720p = lean final, 1080p = standard
+ASPECT=16:9                      # 9:16 for the mobile chain (§6)
+DIVE_DUR=8; CONN_DUR=5           # seconds; arch-A legs use DIVE_DUR
+
+# Stills: gpt-image-2 rendered straight at the VIDEO aspect, so the still IS frame 0
+# of the clip it starts (no 3:2 → 16:9 re-crop at the first seam).
+SMODEL=openai/gpt-image-2
+SSIZE=2048x1152                  # 1152x2048 for native portrait stills
 ```
 
-Higgsfield generations take minutes — every `higgsfield ... --wait` call below is meant
-to run inside a **backgrounded** script. Launch the whole script with your tool's
-background/detached mode and poll the progress log; never block the foreground.
-
-## 1. Scene stills (Step 2)
-
-Write one prompt file per section to `$WORK/still_<name>.txt` (see prompts.md), then:
+## 1. Replicate helpers
 
 ```bash
+# Upload a local file → print an https URL usable as a model input (valid ~24 h).
+# Cached next to the file so re-runs and re-rolls don't re-upload.
+rep_upload() { # localPath
+  local c="$1.url" u
+  if [ -s "$c" ] && [ -n "$(find "$c" -mmin -1200 2>/dev/null)" ]; then cat "$c"; return 0; fi
+  u=$(curl -fsS -H "Authorization: Bearer $REPLICATE_API_TOKEN" \
+        -F "content=@$1" "$API/files" | jq -r '.urls.get // empty')
+  case "$u" in https://*) echo "$u" > "$c"; echo "$u" ;; *) echo "upload failed: $1" >&2; return 1 ;; esac
+}
+
+# Create a prediction on an official model and poll it to a terminal state (≤ 40 min).
+# Writes the final prediction JSON to outJson; returns 0 only on "succeeded".
+rep_run() { # model inputJsonFile outJson
+  local id st k=0
+  id=$(jq -c '{input: .}' "$2" | curl -fsS -X POST \
+    -H "Authorization: Bearer $REPLICATE_API_TOKEN" -H "Content-Type: application/json" \
+    -d @- "$API/models/$1/predictions" | jq -r '.id // empty')
+  [ -z "$id" ] && { echo '{"status":"failed","error":"create failed (check input / token)"}' > "$3"; return 1; }
+  while [ $k -lt 240 ]; do
+    k=$((k+1)); sleep 10
+    curl -fsS -H "Authorization: Bearer $REPLICATE_API_TOKEN" "$API/predictions/$id" > "$3" || continue
+    st=$(jq -r '.status' "$3")
+    case "$st" in succeeded) return 0 ;; failed|canceled|aborted) return 1 ;; esac
+  done
+  return 1
+}
+
+# Download a prediction's output (string or array). Output URLs expire after 1 HOUR.
+rep_fetch() { # predJson outFile
+  local u
+  u=$(jq -r 'if (.output|type)=="array" then .output[0] else .output end // empty' "$1")
+  [ -n "$u" ] && curl -fsSL "$u" -o "$2"
+}
+
+# Spend ledger: one line per billed gen; `spend` prints the running total.
+rate() { # model res → USD per output second (Replicate list price — §8)
+  case "$1:$2" in
+    bytedance/seedance-2.0:480p) echo 0.08 ;;  bytedance/seedance-2.0:720p) echo 0.18 ;;
+    bytedance/seedance-2.0:1080p) echo 0.45 ;; bytedance/seedance-2.0:4k)  echo 1.00 ;;
+    bytedance/seedance-2.0-fast:480p) echo 0.07 ;; bytedance/seedance-2.0-fast:720p) echo 0.15 ;;
+    kwaivgi/kling-v3-video:*) echo 0.224 ;;    # pro mode, audio off
+    *) echo 0.45 ;;
+  esac
+}
+ledger() { echo "$1 $2" >> "$WORK/spend.log"; }    # label usd
+spend()  { awk '{s+=$2} END {printf "spent ≈ $%.2f over %d gens\n", s, NR}' "$WORK/spend.log" 2>/dev/null; }
+
+# Build the video input JSON for $VMODEL (field names differ per model).
+vinput() { # promptFile startUrl endUrl|"" duration outJson
+  case "$VMODEL" in
+    kwaivgi/kling-v3-video)
+      jq -n --rawfile p "$1" --arg s "$2" --arg e "$3" --arg a "$ASPECT" --argjson d "$4" \
+        '{prompt:$p, start_image:$s, aspect_ratio:$a, duration:$d, mode:"pro",
+          generate_audio:false} + (if $e=="" then {} else {end_image:$e} end)' > "$5" ;;
+    *) # seedance-2.0 / -fast
+      jq -n --rawfile p "$1" --arg s "$2" --arg e "$3" --arg a "$ASPECT" --arg r "$VRES" --argjson d "$4" \
+        '{prompt:$p, image:$s, aspect_ratio:$a, resolution:$r, duration:$d,
+          generate_audio:false} + (if $e=="" then {} else {last_frame_image:$e} end)' > "$5" ;;
+  esac
+}
+
+# One video clip. Idempotent (skips if the output exists); logs spend on success.
+gen_clip() { # label promptFile startPng endPng|"" duration outMp4
+  [ -s "$6" ] && { echo "$1 cached"; return 0; }
+  local s e=""
+  s=$(rep_upload "$3") || { echo "$1 FAIL upload"; return 1; }
+  if [ -n "$4" ]; then e=$(rep_upload "$4") || { echo "$1 FAIL upload"; return 1; }; fi
+  vinput "$2" "$s" "$e" "$5" "$WORK/$1.in.json"
+  if rep_run "$VMODEL" "$WORK/$1.in.json" "$WORK/$1.json" && rep_fetch "$WORK/$1.json" "$6"; then
+    ledger "$1" "$(awk -v r="$(rate "$VMODEL" "$VRES")" -v d="$5" 'BEGIN{print r*d}')"
+    echo "$1 ok ($VMODEL $VRES ${5}s)"
+  else
+    echo "$1 FAIL: $(jq -r '.error // .status' "$WORK/$1.json")"; return 1
+  fi
+}
+
+status() {
+  for n in $NAMES; do
+    printf '%-10s still:%s dive:%s leg:%s\n' "$n" \
+      "$([ -s "$WORK/still_$n.png" ] && echo ok || echo --)" \
+      "$([ -s "$WORK/dive_$n.mp4" ] && echo ok || echo --)" \
+      "$([ -s "$WORK/leg_$n.mp4" ] && echo ok || echo --)"
+  done
+  ls "$WORK"/conn_*.mp4 2>/dev/null; spend
+}
+```
+
+**Resume / idempotency.** `$WORK` *is* the run state: every generator skips an output
+that already exists, so a crash, a failed clip, or a moderation re-roll never re-bills
+finished work — just re-run the same loop. To force a re-roll, delete that file first
+(`rm "$WORK/dive_shop.mp4"; gen_dive shop`). A replaced clip has new frames, so whatever
+chains off it (later arch-A legs; the connectors on both sides of a dive) must be deleted
+and re-rolled too.
+
+## 2. Scene stills (Step 2) — anchor first, then batch
+
+Write one prompt file per section to `$WORK/still_<name>.txt` (prompts.md).
+
+```bash
+STYLE_LOCK=""   # set to the approved anchor PNG after the gate
 gen_still() { # name
-  higgsfield generate create gpt_image_2 --prompt "$(cat "$WORK/still_$1.txt")" \
-    --aspect_ratio 3:2 --resolution 2k --quality high --wait --wait-timeout 15m --json \
-    > "$WORK/still_$1.json" 2> "$WORK/still_$1.err"
-  url=$(jq -r '.[0].result_url // empty' "$WORK/still_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/still_$1.png" && echo "still $1 ok" || echo "still $1 FAIL"
+  local o="$WORK/still_$1.png" ref="[]"
+  [ -s "$o" ] && { echo "still $1 cached"; return 0; }
+  [ -n "$STYLE_LOCK" ] && ref=$(jq -n --arg u "$(rep_upload "$STYLE_LOCK")" '[$u]')
+  jq -n --rawfile p "$WORK/still_$1.txt" --arg a "$SSIZE" --argjson r "$ref" \
+    '{prompt:$p, aspect_ratio:$a, quality:"high", background:"opaque", output_format:"png",
+      number_of_images:1} + (if ($r|length)>0 then {input_images:$r} else {} end)' \
+    > "$WORK/still_$1.in.json"
+  if rep_run "$SMODEL" "$WORK/still_$1.in.json" "$WORK/still_$1.json" && rep_fetch "$WORK/still_$1.json" "$o"; then
+    ledger "still_$1" 0.13; echo "still $1 ok"
+  else echo "still $1 FAIL: $(jq -r '.error // .status' "$WORK/still_$1.json")"; fi
 }
-for n in $NAMES; do gen_still "$n" & done ; wait
+
+# 1. Anchor + approval gate — the scene that best expresses the world:
+gen_still farm
+# → SHOW the user still_farm.png. Iterate the preamble until approved. A rejected
+#   anchor: fix the preamble in ALL prompt files, rm the png, re-roll.
+
+# 2. Batch the rest, style-locked to the approved anchor (skip the lock for photoreal
+#    full-bleed scenes — it clones the room; prompts.md):
+STYLE_LOCK="$WORK/still_farm.png"
+for n in $NAMES; do gen_still "$n" & done; wait
 ```
 
-Codex variant (STILLS_SOURCE=codex, SKILL Step 1.7 — subscription-billed, zero
-credits; ~1–3 min each, parallelize in small batches):
-
-```bash
-gen_still_codex() { # name   (< /dev/null is REQUIRED for parallel calls — see SKILL Gotchas)
-  codex exec -C "$WORK" -s workspace-write --skip-git-repo-check \
-    'Use the image generation tool ($imagegen) to generate: '"$(cat "$WORK/still_$1.txt")"' Wide 3:2 landscape, high resolution. Save it as ./still_'"$1"'.png. Do not do anything else.' \
-    > "$WORK/still_$1.codex.log" 2>&1 < /dev/null
-  [ -f "$WORK/still_$1.png" ] && echo "still $1 ok (codex)" || echo "still $1 FAIL (see .codex.log)"
-}
-```
-
-Convert to webp for the site (and optionally run knockout.py first for transparency):
+Site copies (run `references/knockout.py` first if the scenes float):
 
 ```bash
 for n in $NAMES; do cwebp -quiet -q 84 -resize 1800 0 "$WORK/still_$n.png" -o "$ASSETS/$n.webp"; done
 ```
 
-Review the stills for cohesion before continuing. Re-roll any off-style one (optionally
-add `--image "$WORK/still_<good>.png"` to lock style).
+## 3A. Architecture A — sequential legs (continuous forward take)
 
-## 2. Dive-in clips (Step 4)
-
-Prompt files at `$WORK/dive_<name>.txt`. Start image = the solid-bg still PNG.
+No connectors. Leg 0 starts on the first still; every later leg starts on the previous
+leg's ACTUAL last frame. Strictly sequential — look at each last frame before going on.
 
 ```bash
-gen_dive() { # name                       ($VOPTS is unquoted on purpose — word-split flags)
-  higgsfield generate create "$VMODEL" --prompt "$(cat "$WORK/dive_$1.txt")" \
-    --start-image "$WORK/still_$1.png" \
-    $VOPTS --aspect_ratio 16:9 --duration "$DIVE_DUR" \
-    --wait --wait-timeout 20m --json > "$WORK/dive_$1.json" 2> "$WORK/dive_$1.err"
-  url=$(jq -r '.[0].result_url // empty' "$WORK/dive_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/dive_$1.mp4" && echo "dive $1 ok" || echo "dive $1 FAIL"
+gen_legs() {
+  local prev="" n start
+  for n in $NAMES; do
+    if [ -z "$prev" ]; then start="$WORK/still_$n.png"; else start="$WORK/last_leg_$prev.png"; fi
+    gen_clip "leg_$n" "$WORK/leg_$n.txt" "$start" "" "$DIVE_DUR" "$WORK/leg_$n.mp4" || return 1
+    [ -s "$WORK/last_leg_$n.png" ] || \
+      ffmpeg -v error -y -sseof -0.15 -i "$WORK/leg_$n.mp4" -frames:v 1 "$WORK/last_leg_$n.png"
+    prev="$n"
+  done
 }
-for n in $NAMES; do gen_dive "$n" & done ; wait
+gen_legs
 ```
 
-Re-roll individual failures (503 / credit race are transient):
-`gen_dive shop`  (just that one).
+It stops at the first failure; fix it (re-roll / reword) and re-run — finished legs are
+cached. A leg whose last frame isn't a calm forward glide: delete that leg, its
+`last_leg_*.png`, and every leg after it, then re-run.
 
-## 3. Extract boundary frames — the seam handoff (Step 5)
-
-For each adjacent pair, the connector's start = dive_i's LAST frame, end = dive_{i+1}'s
-FIRST frame — extracted from the **rendered videos**, never the stills.
+## 3B. Architecture B — dives (parallel)
 
 ```bash
-set -- $NAMES
-prev=""
-for n in "$@"; do
-  ffmpeg -v error -ss 0 -i "$WORK/dive_$n.mp4" -frames:v 1 -q:v 2 "$WORK/first_$n.png"      # establishing
-  ffmpeg -v error -sseof -0.15 -i "$WORK/dive_$n.mp4" -frames:v 1 -q:v 2 "$WORK/last_$n.png" # interior
+gen_dive() { gen_clip "dive_$1" "$WORK/dive_$1.txt" "$WORK/still_$1.png" "" "$DIVE_DUR" "$WORK/dive_$1.mp4"; }
+for n in $NAMES; do gen_dive "$n" & done; wait
+```
+
+## 4. Boundary frames + connectors (architecture B)
+
+Connector start = dive_i's LAST frame, end = dive_{i+1}'s FIRST frame — extracted from
+the **rendered videos**, never the stills.
+
+```bash
+for n in $NAMES; do
+  ffmpeg -v error -y -ss 0       -i "$WORK/dive_$n.mp4" -frames:v 1 "$WORK/first_$n.png"
+  ffmpeg -v error -y -sseof -0.15 -i "$WORK/dive_$n.mp4" -frames:v 1 "$WORK/last_$n.png"
 done
-```
 
-## 4. Connector clips (Step 5)
-
-Prompt files at `$WORK/conn_<i>.txt` (i = 1..N-1). Iterate adjacent pairs:
-
-```bash
-gen_conn() { # i startPng endPng          (end-image required → seedance/kling3_0 only)
-  higgsfield generate create "$VMODEL" --prompt "$(cat "$WORK/conn_$1.txt")" \
-    --start-image "$2" --end-image "$3" \
-    $VOPTS --aspect_ratio 16:9 --duration "$CONN_DUR" \
-    --wait --wait-timeout 20m --json > "$WORK/conn_$1.json" 2> "$WORK/conn_$1.err"
-  url=$(jq -r '.[0].result_url // empty' "$WORK/conn_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/conn_$1.mp4" && echo "conn $1 ok" || echo "conn $1 FAIL"
-}
-set -- $NAMES ; i=0 ; prev=""
+gen_conn() { gen_clip "conn_$1" "$WORK/conn_$1.txt" "$2" "$3" "$CONN_DUR" "$WORK/conn_$1.mp4"; }
+set -- $NAMES; i=0; prev=""
 for n in "$@"; do
   if [ -n "$prev" ]; then i=$((i+1)); gen_conn "$i" "$WORK/last_$prev.png" "$WORK/first_$n.png" & fi
   prev="$n"
-done ; wait
+done; wait
 ```
 
-## 5. Encode everything for scrubbing (Step 6)
+Re-extract frames whenever a dive is re-rolled (`-y` overwrites; also delete the stale
+`*.png.url` upload caches for those frames), and delete the connectors on both sides.
 
-Native resolution (1080p from seedance std; kling3_0 std returned **720p** in testing —
-never upscale, encode what ffprobe reports), crf 20, GOP 8, light sharpen, no audio,
-faststart. Same for dives + connectors.
+## 5. Encode for scrubbing (Step 6)
+
+Native resolution (never upscale — encode what ffprobe reports), crf 20, GOP 8, light
+sharpen, no audio, faststart.
 
 ```bash
 enc() { ffmpeg -v error -y -i "$1" -an -vf "unsharp=5:5:0.8:5:5:0.0" \
   -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p \
   -g 8 -keyint_min 8 -sc_threshold 0 -movflags +faststart "$2"; echo "enc $2 $(du -h "$2"|cut -f1)"; }
 
+# arch B
 for n in $NAMES; do enc "$WORK/dive_$n.mp4" "$ASSETS/vid/$n.mp4"; done
-i=0; for f in "$WORK"/conn_*.mp4; do i=$((i+1)); enc "$f" "$ASSETS/vid/conn$i.mp4"; done
+set -- $NAMES; i=0; while [ $i -lt $(($# - 1)) ]; do i=$((i+1)); enc "$WORK/conn_$i.mp4" "$ASSETS/vid/conn$i.mp4"; done
+# arch A
+# for n in $NAMES; do enc "$WORK/leg_$n.mp4" "$ASSETS/vid/$n.mp4"; done
 ```
 
-Now the engine config's `sections[k].clip = assets/vid/<name>.mp4` and
-`connectors = [assets/vid/conn1.mp4, …]` (length N-1, in order).
+`sections[k].clip = assets/vid/<name>.mp4`; `connectors = [assets/vid/conn1.mp4, …]`
+(length N-1; `[]` for arch A). A connector you gave up on → leave its file absent and
+put `null` in that slot; the engine crossfades that seam directly.
 
-## 6. Centre-crop mobile encodes — FALLBACK ONLY, not the mobile version
+## 5b. Posters — the encoded clip's own first frame
 
-**The mobile version is the native 9:16 portrait chain (§6b).** This section's crop
-encodes exist for one case: the user opted into mobile but credits can't cover the
-portrait chain — and shipping them must be called out and approved, never silent
-(portrait phones will see the landscape film's centre ~26%). The encode mechanics
-matter either way: scrubbing sets `currentTime` every frame, and a phone decoder's
-**seek cost scales with how many frames it must decode from the nearest keyframe** — so
-a 1080p `-g 8` master that scrubs fine on a laptop stutters on a phone. A **smaller
-frame + tighter GOP** fixes that (and halves the bytes on cellular). The crop `-m.mp4`
-sibling per clip:
+The poster shows until the clip paints; if it isn't the clip's own frame 0, the first
+thing a visitor sees pops. Same doctrine as the seams — hand off actual frames:
 
 ```bash
-# 720p, GOP 4 (twice the keyframes = ~half the seek-decode work), crf 23, same sharpen/faststart.
-encm() { ffmpeg -v error -y -i "$1" -an -vf "scale=-2:720,unsharp=5:5:0.6:5:5:0.0" \
-  -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p \
-  -g 4 -keyint_min 4 -sc_threshold 0 -movflags +faststart "$2"; echo "encm $2 $(du -h "$2"|cut -f1)"; }
-
-for n in $NAMES; do encm "$WORK/dive_$n.mp4" "$ASSETS/vid/$n-m.mp4"; done
-i=0; for f in "$WORK"/conn_*.mp4; do i=$((i+1)); encm "$f" "$ASSETS/vid/conn$i-m.mp4"; done
+for n in $NAMES; do
+  ffmpeg -v error -y -ss 0 -i "$ASSETS/vid/$n.mp4" -frames:v 1 "$WORK/poster_$n.png"
+  cwebp -quiet -q 84 "$WORK/poster_$n.png" -o "$ASSETS/$n-poster.webp"
+done
 ```
 
-Wire the variants in the engine config — the engine serves them automatically on phones,
-falling back to the desktop `clip` when a mobile one is absent:
+Wire `sections[k].poster`. Keep `still` — it's the stills-mode artwork.
 
-```js
-sections[k].clipMobile = 'assets/vid/<name>-m.mp4';
-connectorsMobile = ['assets/vid/conn1-m.mp4', …];   // length N-1, in order
-```
+## 5c. Seam gate — automated first, then eyeball
 
-If phone scrubbing still stutters, tighten the GOP further (`-g 2`, or `-g 1` for all-intra
-= instant seeks at the cost of larger files); if cellular weight is the bigger worry, raise
-`crf` (24–26) or drop to `scale=-2:600`. If the master is already 720p (e.g. kling3_0 std),
-the mobile encode still pays off — the tighter GOP is what makes phone seeks cheap. All-mobile encodes stay 16:9 — the engine
-centre-crops them; see the portrait note in SKILL Step 8 / prompts.md.
-
-## 6b. Native 9:16 portrait chain — THE mobile version (Step 1.6 opt-in)
-
-When the user opts into mobile, this is what they get: a **parallel 9:16 chain** rendered
-natively for phones and shipped as the mobile variants — never the §6 crops (those are the
-no-credits stopgap). Same seam laws as the main chain — the portrait chain frame-locks
-against its own rendered frames, never the landscape ones. Budget ~2N-1 video gens +
-re-rolls (interiors trip the NSFW filter in portrait too); state the credit cost at the
-Step 1.6 interview.
-
-1. **Portrait start canvases.** Don't hand the video model a 3:2 still and hope: composite
-   each scene onto a 1080×1920 canvas in the page bg colour (island at ~94% width, visual
-   centre at ~45% height). The render then opens exactly on what the portrait poster shows.
-   For knocked-out stills, composite the RGBA over the bg colour first.
-2. **Dives/legs**: same prompt templates with a portrait clause up front ("Vertical
-   portrait composition, the diorama centered with generous [bg] space above and below"),
-   `--aspect_ratio 9:16`, same model/params as the main chain. Review each last frame
-   before chaining, as ever.
-3. **Connectors**: extract first/last frames **from the 9:16 renders** and generate 9:16
-   connectors between them. A native 9:16 scene mixed into cropped-16:9 neighbours pops at
-   both seams — the portrait chain must be complete, not partial.
-4. **Encode** with the §6 settings but portrait-oriented scale: `scale=720:-2` (720 wide),
-   `-g 4`, crf 23 → these ARE the `-m.mp4` mobile files (and they replace any §6 crop
-   stopgaps that shipped earlier).
-5. **Posters**: extract each 9:16 dive's first frame → webp → wire as the section's
-   `stillMobile` so the poster matches the portrait video's frame 0 (no landscape→portrait
-   flash when the clip paints). Engine support: `sections[k].stillMobile`.
-
-## 7. Monid backend — Seedance 2.0 pay-per-clip (the DEFAULT; qualified 2026-07-25)
-
-`bytedance /v1/video/seedance-2.0` via Monid is the roster's `seedance_2_0` billed
-per clip in USD, and the **default** chain backend (SKILL Step 4 → Monid backend;
-both probes passed) — use these functions in the §2/§4 loops unless the build fell
-back to Higgsfield credits. Same chain laws as everywhere else — only the I/O
-differs: **frames ride Monid's free `sfs` file
-system** (inline base64 is rejected), **`ratio` must be explicit** (the adaptive
-default follows the input image's aspect), and runs are fire-and-poll. Token-priced
-`w×h×24×sec/1024` at $7/1M (480p/720p), $7.7/1M (1080p) — measured: 1080p ≈ $2.99
-dive / $1.87 connector; 720p ≈ $1.21 / $0.76; 480p previz ≈ $0.28 / $0.35.
+SSIM of each seam's boundary frames, measured at **composition scale** (320 wide +
+blur), so Seedance's frame-0 re-render shimmer doesn't read as a mismatch — upstream saw
+correct seams score only 18–25 dB PSNR at full resolution. A real mismatch is different
+composition or props, and that survives the downscale.
 
 ```bash
-# helper: upload a local frame to sfs, print a signed public URL for it ($0).
-# NB: /cat and /ls take the SAME relative path you gave /put — not the
-# "home/..."-prefixed path /put echoes back (that one 404s).
-monid_frame_url() { # localPng remoteName  (JPEG-compresses on the way up)
-  jpg="$WORK/sfs_$2.jpg"
-  ffmpeg -v error -y -i "$1" -vf "scale='min(1536,iw)':-2" -q:v 2 "$jpg"
-  size=$(stat -f%z "$jpg")
-  up=$(NO_COLOR=1 monid run -p sfs -e /put \
-    -i "{\"path\":\"chain/$2.jpg\",\"sizeBytes\":$size,\"ttl\":\"1h\"}" -w 60 -j \
-    | jq -r '.output.uploadUrl')
-  curl -fsS -T "$jpg" "$up" > /dev/null
-  NO_COLOR=1 monid run -p sfs -e /cat -i "{\"path\":\"chain/$2.jpg\",\"ttl\":\"1d\"}" \
-    -w 60 -j | jq -r '.output.url'
+seam_ssim() { # fileA fileB
+  ffmpeg -v error -y -sseof -0.05 -i "$1" -frames:v 1 -vf "scale=320:-2,gblur=sigma=1.5" "$WORK/_sa.png"
+  ffmpeg -v error -y -ss 0       -i "$2" -frames:v 1 -vf "scale=320:-2,gblur=sigma=1.5" "$WORK/_sb.png"
+  ffmpeg -v info -i "$WORK/_sa.png" -i "$WORK/_sb.png" -lavfi ssim -f null - 2>&1 \
+    | grep -o 'All:[0-9.]*' | cut -d: -f2
 }
-
-# fire-and-poll (the CLI's -w caps at 120s and seedance can exceed it)
-monid_wait() { # runId outJson
-  while :; do
-    NO_COLOR=1 monid runs get -r "$1" -j > "$2" 2>/dev/null
-    case "$(jq -r '.status // empty' "$2")" in
-      COMPLETED|FAILED|BLOCKED|STOPPED|TIME_OUT) break ;;
-    esac
-    sleep 8
-  done
+check() { # fileA fileB label
+  local s; s=$(seam_ssim "$1" "$2")
+  case $(awk -v s="${s:-0}" 'BEGIN{print (s>=0.90)?"pass":(s>=0.75)?"warn":"fail"}') in
+    pass) echo "PASS  $3  ssim=$s" ;;
+    warn) echo "WARN  $3  ssim=$s — eyeball it (the crossfade usually covers a near-miss end frame)" ;;
+    *)    echo "FAIL  $3  ssim=$s — endpoints aren't the neighbours' frames, or the wrong frame was extracted" ;;
+  esac
 }
-
-gen_dive_monid() { # name   (VRES=1080p|720p|480p; DIVE_DUR as usual)
-  furl=$(monid_frame_url "$WORK/still_$1.png" "still_$1")
-  jq -n --arg p "$(cat "$WORK/dive_$1.txt")" --arg u "$furl" --arg r "$VRES" \
-    '{content:[{type:"text",text:$p},
-               {type:"image_url",image_url:{url:$u},role:"first_frame"}],
-      resolution:$r, duration:'"$DIVE_DUR"', ratio:"16:9", generate_audio:false}' \
-    > "$WORK/dive_$1.body.json"
-  rid=$(NO_COLOR=1 monid run -p bytedance -e /v1/video/seedance-2.0 \
-    -f "$WORK/dive_$1.body.json" -j | jq -r '.runId')
-  monid_wait "$rid" "$WORK/dive_$1.json"
-  url=$(jq -r '.output.content.video_url // empty' "$WORK/dive_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/dive_$1.mp4" \
-    && echo "dive $1 ok (\$$(jq -r '.cost.value' "$WORK/dive_$1.json"))" \
-    || echo "dive $1 FAIL ($(jq -r '.status' "$WORK/dive_$1.json"))"
-}
-
-gen_conn_monid() { # i startPng endPng
-  su=$(monid_frame_url "$2" "conn$1_start"); eu=$(monid_frame_url "$3" "conn$1_end")
-  jq -n --arg p "$(cat "$WORK/conn_$1.txt")" --arg s "$su" --arg e "$eu" --arg r "$VRES" \
-    '{content:[{type:"text",text:$p},
-               {type:"image_url",image_url:{url:$s},role:"first_frame"},
-               {type:"image_url",image_url:{url:$e},role:"last_frame"}],
-      resolution:$r, duration:'"$CONN_DUR"', ratio:"16:9", generate_audio:false}' \
-    > "$WORK/conn_$1.body.json"
-  rid=$(NO_COLOR=1 monid run -p bytedance -e /v1/video/seedance-2.0 \
-    -f "$WORK/conn_$1.body.json" -j | jq -r '.runId')
-  monid_wait "$rid" "$WORK/conn_$1.json"
-  url=$(jq -r '.output.content.video_url // empty' "$WORK/conn_$1.json")
-  [ -n "$url" ] && curl -fsSL "$url" -o "$WORK/conn_$1.mp4" \
-    && echo "conn $1 ok (\$$(jq -r '.cost.value' "$WORK/conn_$1.json"))" \
-    || echo "conn $1 FAIL ($(jq -r '.status' "$WORK/conn_$1.json"))"
-}
+# arch B
+set -- $NAMES; i=0; prev=""
+for n in "$@"; do
+  if [ -n "$prev" ]; then i=$((i+1))
+    check "$ASSETS/vid/$prev.mp4" "$ASSETS/vid/conn$i.mp4" "$prev>conn$i"
+    check "$ASSETS/vid/conn$i.mp4" "$ASSETS/vid/$n.mp4"   "conn$i>$n"
+  fi; prev="$n"
+done
+# arch A: check consecutive "$ASSETS/vid/<name>.mp4" pairs the same way.
 ```
 
-Default usage in §2/§4: same loops, `gen_dive_monid`/`gen_conn_monid` in place of
-the Higgsfield `gen_dive`/`gen_conn` (mobile chain: `ratio:"9:16"` and the §6b
-portrait canvases). Previz: same functions with `VRES=480p`.
-Result URLs expire (~24–48 h) — the functions download immediately. Read the billed
-`cost.value` per clip (echoed in the ok-line) and `monid balance` between phases; a
-`BLOCKED` status is a workspace budget/run cap — terminal, surface it to the user.
-Frame extraction, encoding, QA: identical to the Higgsfield path.
+**Thresholds are provisional** — not yet calibrated on Replicate output. On the first
+build, write each seam's score next to your eyeball verdict and adjust them here. WARN
+means look, not re-roll. Re-run after every re-roll: one replaced clip touches both of
+its seams.
 
-**Qualification harness for future/changed endpoints** (each probe = one cheap 480p
-clip): (1) prompt + first_frame from a real still → downloaded video's frame 0 must
-match the still (eyeball + PSNR ≳ 30 dB) and `cost.value` must match the advertised
-cell; (2) add a last_frame from a *different* still → the final frame must land on
-that composition (Seedance-style near-miss ok — the crossfade covers it). Known
-failure to watch for (it's why the harness exists): `minimax /v1/video_generation`
-still silently drops the image when `prompt` is present — image-only output proves
-nothing about steerability.
+## 6. Mobile — native 9:16 portrait chain (Step 1.6 opt-in)
 
-## Notes
+A **parallel 9:16 chain**, frame-locked against its OWN renders — never a crop, never
+mixed with landscape frames (a clip can't change aspect mid-chain). Same functions,
+different settings and names:
 
-- `.[0].result_url` is the field on the `--wait --json` job object. `.min_result_url` is
-  a lower-res preview if you ever want it.
-- **NSFW fallback across models**: if one clip keeps getting flagged on seedance after
-  re-rolls + prompt scrubbing, regenerate just that clip on `kling3_0` with the SAME
-  start/end frames: `VMODEL=kling3_0; VOPTS="--mode std --sound off"; gen_conn 3 …` —
-  then restore your chain model. See SKILL Gotchas for the trade-off.
-- **Previz on the cheap**: run the whole chain once with `VMODEL=seedance_2_0_mini`
-  (frame-locking intact, ~720p) to validate the journey and seams before spending
-  full-model credits — because it's still seamless, the previz translates directly to the
-  final render. Don't reach for reference-only models here: without `--start/--end-image`
-  they can't hold a seam, so their output can't be chained (Step 4 rule).
-- If a whole batch stalls, check `higgsfield workspace list` for credits and
-  `$WORK/*.err` for the reason.
-- Concurrency: launching ~5–6 gens at once is fine; much more can trigger transient
-  credit/race errors — stagger or re-roll.
+1. **Portrait starts.**
+   - Floating-island dioramas: composite each knocked-out still onto a 1080×1920 canvas
+     in the page bg colour (island ~94% width, visual centre ~45% height) — the
+     identical island, re-framed:
+     ```bash
+     pcanvas() { # cutoutPng bgHex outPng
+       python3 -I -c 'import sys
+     from PIL import Image
+     src, bg, out = sys.argv[1:4]
+     im = Image.open(src).convert("RGBA"); W, H = 1080, 1920
+     w = int(W * .94); h = int(im.height * w / im.width); im = im.resize((w, h), Image.LANCZOS)
+     c = Image.new("RGBA", (W, H), bg); c.alpha_composite(im, ((W - w) // 2, int(H * .45) - h // 2))
+     c.convert("RGB").save(out)' "$1" "$2" "$3"; }
+     for n in $NAMES; do pcanvas "$WORK/still_$n.cut.png" "#F5EDE0" "$WORK/pstill_$n.png"; done
+     ```
+   - Full-bleed / photoreal: re-render each still with `SSIZE=1152x2048`, the same prompt
+     plus a vertical-recomposition clause, style-locked to its landscape still.
+2. **Clips**: `ASPECT=9:16`, the portrait clause first in every prompt (prompts.md), and
+   `_p` names throughout — e.g.
+   `gen_clip "dive_${n}_p" "$WORK/dive_${n}_p.txt" "$WORK/pstill_$n.png" "" "$DIVE_DUR" "$WORK/dive_${n}_p.mp4"`.
+   Extract boundary frames from the portrait renders and build portrait connectors
+   between them.
+3. **Encode** 720 wide, GOP 4 (a phone's seek cost scales with distance to the keyframe):
+   ```bash
+   encm() { ffmpeg -v error -y -i "$1" -an -vf "scale=720:-2,unsharp=5:5:0.6:5:5:0.0" \
+     -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p \
+     -g 4 -keyint_min 4 -sc_threshold 0 -movflags +faststart "$2"; }
+   ```
+   → `assets/vid/<name>-m.mp4`, `assets/vid/conn<i>-m.mp4`.
+4. **Posters** from the `-m.mp4` first frames (§5b recipe) → `assets/<name>-poster-m.webp`.
+5. **Seam gate** (§5c) on the portrait chain on its own.
+
+Wire `clipMobile`, `posterMobile`, `connectorsMobile`. Budget ≈ the desktop chain's video
+spend again.
+
+**Crop stopgap — only with the user's explicit OK:** `encm` the 16:9 masters with
+`scale=-2:720` instead. Phones then see the centre ~26% of the frame. Say so; it is not
+the mobile version.
+
+## 7. Qualification probes — before the first build, and whenever a model changes
+
+Replicate model versions move. Two cheap 480p clips prove the chain will hold
+(≈ $0.80 + two stills). Needs two real stills, `still_A.png` and `still_B.png`, and two
+short prompt files.
+
+```bash
+VRES=480p
+# (1) start-frame lock: a leg from a real still
+gen_clip probe_leg "$WORK/probe_leg.txt" "$WORK/still_A.png" "" 5 "$WORK/probe_leg.mp4"
+ffmpeg -v error -y -ss 0 -i "$WORK/probe_leg.mp4" -frames:v 1 "$WORK/probe_f0.png"
+ffmpeg -v info -i "$WORK/probe_f0.png" -i "$WORK/still_A.png" \
+  -lavfi "[1][0]scale2ref[a][b];[b][a]psnr" -f null - 2>&1 | grep -o 'average:[0-9.inf]*'
+# (2) end-frame landing: a connector from still A to a DIFFERENT still B
+gen_clip probe_conn "$WORK/probe_conn.txt" "$WORK/still_A.png" "$WORK/still_B.png" 5 "$WORK/probe_conn.mp4"
+ffmpeg -v error -y -sseof -0.05 -i "$WORK/probe_conn.mp4" -frames:v 1 "$WORK/probe_fN.png"
+ffmpeg -v info -i "$WORK/probe_fN.png" -i "$WORK/still_B.png" \
+  -lavfi "[1][0]scale2ref[a][b];[b][a]psnr" -f null - 2>&1 | grep -o 'average:[0-9.inf]*'
+ffprobe -v error -show_entries stream=codec_type,width,height,duration -of csv=p=0 "$WORK/probe_conn.mp4"
+```
+
+Pass: (1) frame 0 matches the still to codec noise (PSNR ≳ 30 dB) at the requested
+aspect; (2) the last frame lands on B's composition (a Seedance-style near-miss is fine —
+the engine crossfade covers it); no audio stream; duration as requested. Record the
+numbers and the date in SKILL Step 4.
+
+## 8. Notes
+
+- **Prices** in `rate()` are Replicate list prices read 2026-11-18 from each model page:
+  seedance-2.0 $0.08 / $0.18 / $0.45 / $1.00 per output second at 480p / 720p / 1080p /
+  4k (image inputs; video inputs cost more); seedance-2.0-fast $0.07 / $0.15 (480p/720p
+  only); kling-v3-video pro ≈ $0.224/s with audio off; gpt-image-2 high ≈ $0.13/image.
+  Re-check before quoting a budget. The ledger is an estimate; the Replicate dashboard is
+  the bill.
+- **Moderation failures** come back as `status: failed` with an error string, which
+  `gen_clip` prints. Re-roll, then reword, then the Kling fallback for that one clip
+  (gotchas.md): `VMODEL=kwaivgi/kling-v3-video; rm "$WORK/conn_3.mp4"; gen_conn 3 …;
+  VMODEL=bytedance/seedance-2.0`. Kling's native resolution may differ — encode what
+  ffprobe reports.
+- **Previz** = the same model at `VRES=480p` (one model by construction, so seams and
+  motion translate to the final). After approval: `VRES=1080p`, delete the draft clips,
+  frames and their upload caches
+  (`rm -f "$WORK"/{dive,conn,leg}_*.mp4 "$WORK"/{first,last,last_leg}_*.png*`), re-run.
+  Stills are reused. Don't previz on `seedance-2.0-fast` — barely cheaper, and a
+  different model.
+- Output URLs expire after **1 hour** and uploaded files after ~24 h — the helpers
+  download immediately and re-upload when a cache is stale.

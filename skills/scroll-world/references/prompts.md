@@ -18,17 +18,14 @@ Collect and write down:
   locked-iso clause below: one fixed angle for the whole film). **Always asked**
   (SKILL Step 1.4), presented by feel with a one-line trade-off each.
 - `MOBILE` — yes/no. **Always asked** (SKILL Step 1.6), presented to the user
-  with the ~2× credit cost stated. Yes = the **native 9:16 portrait chain**
+  with the ~2× video cost stated in dollars. Yes = the **native 9:16 portrait chain**
   (pipeline §6b): portrait renders of every dive/connector +
   `clipMobile`/`connectorsMobile`/`stillMobile` wiring + the full mobile QA. The
-  §6 crop encodes are a no-credits stopgap only.
-- `VIDEO_TIER` — default is `seedance_2_0` **via Monid** (pay-per-clip; previz =
-  same endpoint at 480p, final at 1080p). Higgsfield-credit alternates: draft
-  (`seedance_2_0_mini`) | standard (`seedance_2_0`) | alternate (`kling3_0`).
+  crop encodes (pipeline §6) are a stopgap the user must explicitly approve.
+- `VIDEO_TIER` — resolution of `bytedance/seedance-2.0` on Replicate: 480p (previz) |
+  720p (lean final) | 1080p (standard, default) | 4k. Same model at every tier.
   Chosen by cost at SKILL Step 1.7, with the estimated total stated before
   anything renders.
-- `STILLS_SOURCE` — higgsfield (`gpt_image_2`, spends credits) | codex
-  (`image_gen`, subscription-billed; only offer when the Codex CLI is present).
 
 ## Style preamble (default: clay diorama)
 
@@ -47,7 +44,7 @@ Alternate directions (swap the first two sentences, keep the palette/no-text tai
 - **Glossy toy:** "Isometric glossy vinyl-toy diorama, smooth plastic shading, soft rim light, collectible figurine look."
 - **Claymation:** "Isometric stop-motion clay set, visible thumbprints, handmade plasticine texture, soft studio softbox light."
 - **Neon night:** "Isometric miniature at night, warm interior glow and neon signage, moody rim light, wet reflective ground."
-- **Photoreal architectural** (real estate, hospitality, premium/luxury): "Ultra-photorealistic architectural photography of a single cohesive [subject], cinematic wide-angle, warm golden-hour light, natural materials, restrained designer furnishings, a breathtaking view, editorial magazine quality (Architectural Digest), shallow depth of field, no people." For photoreal, drop the floating-island framing and the knockout (Step 3) — the scenes are **full-bleed** (a dark page background reads premium), the "dive" glides *through doorways/glass* rather than opening a roof, and cohesion comes entirely from the identical preamble (do NOT pass an `--image` reference — it clones the same room). Interiors trip Seedance's NSFW filter often; see SKILL Gotchas.
+- **Photoreal architectural** (real estate, hospitality, premium/luxury): "Ultra-photorealistic architectural photography of a single cohesive [subject], cinematic wide-angle, warm golden-hour light, natural materials, restrained designer furnishings, a breathtaking view, editorial magazine quality (Architectural Digest), shallow depth of field, no people." For photoreal, drop the floating-island framing and the knockout (Step 3) — the scenes are **full-bleed** (a dark page background reads premium), the "dive" glides *through doorways/glass* rather than opening a roof, and cohesion comes entirely from the identical preamble (leave `STYLE_LOCK` empty — a reference image clones the same room). Interiors trip Seedance's content filter often; see gotchas.md.
 
 ## Scene still prompt (Step 2)
 
@@ -68,12 +65,17 @@ Tips:
   (pipeline §6b), so this is not about surviving a crop — but a centred composition makes
   the portrait renders open cleanly from the same still, and it keeps the dive's focal
   point where the camera actually flies.
-- Aspect `3:2`, `--resolution 2k --quality high`.
+- Size `2048x1152` (16:9 — the video's own aspect, so the still is frame 0 of its
+  clip), `quality: high`. Portrait chain: `1152x2048`.
+- **Style-locked batch** (`STYLE_LOCK` set, pipeline §2): the anchor rides along as an
+  `input_images` reference, so add one line at the top of the prompt — "Match the art
+  style, palette, lighting and camera angle of the reference image exactly, but depict a
+  new scene:" — otherwise gpt-image-2 may edit the anchor instead of making a sibling.
 
 ## Leg prompt — architecture A, continuous forward take (Step 4)
 
-`--start-image = previous leg's ACTUAL last frame` (leg 0: the first scene's still).
-**No `--end-image`.** The bolded clauses are the motion-handoff contract — keep them
+Start image = previous leg's ACTUAL last frame (leg 0: the first scene's still).
+**No end image.** The bolded clauses are the motion-handoff contract — keep them
 verbatim; the mid-leg move is where the expression goes.
 
 ```
@@ -120,7 +122,7 @@ orbit). If it doesn't, re-roll this leg — a bad handoff frame poisons every le
 
 ## Dive-in clip prompt (Step 4)
 
-`--start-image = the scene still` (solid-bg version).
+Start image = the scene still (solid-bg version).
 
 ```
 Single continuous cinematic camera move, no cuts. Begin high and far, looking down at the
@@ -135,14 +137,12 @@ subtle parallax. No text, no captions.
 For scenes with no building to open (a field, a plaza, a road), replace the roof clause
 with "the camera flies low across [the scene] toward [focal point]."
 
-Params by chain model (SKILL Step 4 table): seedance —
-`--mode std --resolution 1080p --aspect_ratio 16:9 --duration 8`, no audio flag;
-kling3_0 — `--mode std --sound off --aspect_ratio 16:9 --duration 10` (no `--resolution`
-param). Same for architecture-A legs.
+Params (pipeline `vinput`): seedance-2.0 — `resolution` per tier, `aspect_ratio 16:9`,
+`duration 8`, `generate_audio false`. Same for architecture-A legs.
 
 ## Connector clip prompt (Step 5)
 
-`--start-image = dive_i LAST frame` (extracted), `--end-image = dive_{i+1} FIRST frame`
+Start image = dive_i LAST frame (extracted), end image = dive_{i+1} FIRST frame
 (extracted). Both from the RENDERED videos, not the stills.
 
 ```
@@ -157,9 +157,16 @@ For the last connector into a hero-product finale: "…glides forward and the wo
 dissolves toward a single giant [PRODUCT] floating in soft [BG] space, arriving in front
 of it."
 
-seedance: `--mode std --resolution 1080p --aspect_ratio 16:9 --duration 5`; kling3_0:
-`--mode std --sound off --aspect_ratio 16:9 --duration 5`. Connectors need `--end-image`
-→ use a roster model that accepts it (Step 4).
+`duration 5`. Connectors need an end image — every roster model takes one (Step 4).
+
+## Portrait clause (mobile chain, pipeline §6)
+
+Prepend to every dive / leg / connector prompt of the 9:16 chain:
+
+```
+Vertical portrait composition. [The diorama / the scene] stays centered with generous
+[BG] space above and below; the camera move is framed for a tall phone screen.
+```
 
 ## Copy per section (for the engine config)
 
