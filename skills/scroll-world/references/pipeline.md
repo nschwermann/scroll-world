@@ -141,6 +141,15 @@ What it can and can't do for this skill:
 - **Different model than the final.** A draft validates stills, journey, camera moves,
   copy, pacing and page wiring — not Seedance's seam character. Run the Replicate
   qualification probes (§7) before the final, and eyeball its first seams.
+- **Cost.** On the subscription session, renders are covered by the plan (verified: a
+  still + a 480p clip left usage at 0%). Each response still carries
+  `usage.cost_in_usd_ticks` at list price — ≈ $0.08 per 2k still, ≈ $0.08/s of 480p
+  video — which is what `XAI_API_KEY` bills. `grok_cost` logs $0 on the session.
+- **Shapes.** Stills at `resolution:"2k"` 16:9 come back 2816×1584. A "16:9" 480p clip
+  is **736×400** (≈ 1.84:1): Grok centre-crops the start image a little top and bottom,
+  so keep essentials off those edges. Clips carry an audio track; `enc` drops it.
+- **Session lifetime.** The `grok login` token lasts ≈ 12 h (`expires_at` in
+  `auth.json`). A draft spanning days may need a fresh `grok login`.
 
 ```bash
 GROK_API=https://api.x.ai/v1
@@ -154,6 +163,10 @@ grok_token() {
 grok_datauri() { # image → writes "<image>.duri" (JPEG data URI; inline is how xAI takes images)
   ffmpeg -v error -y -i "$1" -q:v 2 "$1.grok.jpg"
   { printf 'data:image/jpeg;base64,'; base64 -i "$1.grok.jpg" | tr -d '\n'; } > "$1.duri"
+}
+grok_cost() { # json → USD actually billed. The API always reports a list-price cost
+  # (usage.cost_in_usd_ticks, 1 USD = 1e10 ticks); a subscription session isn't charged it.
+  if [ -n "${XAI_API_KEY:-}" ]; then jq -r '(.usage.cost_in_usd_ticks // 0) / 1e10' "$1"; else echo 0; fi
 }
 grok_post() { # path inJson outJson
   curl -sS -H "Authorization: Bearer $(grok_token)" -H "Content-Type: application/json" \
@@ -178,7 +191,7 @@ grok_still() { # name
   jq -r '.data[0].b64_json // empty' "$WORK/still_$1.json" > "$WORK/still_$1.b64"
   if [ -s "$WORK/still_$1.b64" ] && base64 -d -i "$WORK/still_$1.b64" -o "$WORK/still_$1.jpg" \
      && ffmpeg -v error -y -i "$WORK/still_$1.jpg" "$o"; then
-    ledger "still_$1" 0; echo "still $1 ok (grok)"
+    ledger "still_$1" "$(grok_cost "$WORK/still_$1.json")"; echo "still $1 ok (grok)"
   else echo "still $1 FAIL (grok): $(jq -c '.error // .code // .' "$WORK/still_$1.json" | head -c 300)"; fi
 }
 
@@ -202,7 +215,7 @@ grok_clip() { # label promptFile startPng endPng|"" duration outMp4
   done
   if [ "$st" = done ] && [ "$(jq -r '.video.respect_moderation' "$WORK/$1.json")" != false ] \
      && curl -fsSL "$(jq -r '.video.url' "$WORK/$1.json")" -o "$6"; then
-    ledger "$1" 0; echo "$1 ok (grok $VRES ${5}s)"
+    ledger "$1" "$(grok_cost "$WORK/$1.json")"; echo "$1 ok (grok $VRES ${5}s)"
   else
     echo "$1 FAIL (grok ${st:-timeout}): $(jq -c '.error // .video // {}' "$WORK/$1.json" | head -c 300)"; return 1
   fi
