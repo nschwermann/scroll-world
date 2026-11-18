@@ -6,7 +6,8 @@ description: >
   camera flies from outside each scene into its interior, then flows on to the next
   scene with NO cuts — one continuous connected flight (Emons-style isometric diorama
   world, or any art direction). Interviews the user for the topic, story beats, brand
-  kit, camera style and budget; renders cohesive stills (gpt-image-2) and frame-locked
+  kit, camera style and budget; drafts the whole world free on Grok Imagine when a Grok
+  session exists, then renders cohesive stills (gpt-image-2 or Grok) and frame-locked
   camera clips (Seedance 2.0) through the Replicate API; wires a portable,
   framework-agnostic scroll-scrub engine. Use when the user wants a "3D world" /
   "browse-through-the-industry" hero, a scroll cinematic, a diorama landing, or to turn
@@ -32,8 +33,9 @@ that continues another starts on that clip's **actual rendered frame**, never on
 still. Getting this wrong is the most common failure and produces a visible "pop".
 
 **The other rule: nothing bills before the user says go.** The interview ends with a
-dollar estimate and an explicit approval; the first still is an approval gate; previz
-runs before the full-resolution chain.
+dollar estimate and an explicit approval; the first still is an approval gate; a draft
+pass (free on Grok Imagine when available, else a 480p previz) runs before the
+full-resolution chain.
 
 Don't assume a frontend framework. `references/scrub-engine.js` is self-contained
 vanilla JS (it builds its own DOM and injects its own CSS into a container you give it),
@@ -56,9 +58,16 @@ so it drops into plain HTML, Next.js, Vue, a Python-served page, anything.
    seedance-2.0 must list `image` + `last_frame_image`; kling-v3-video `start_image` +
    `end_image`. If a field moved, fix `vinput` in pipeline.md and re-run the
    qualification probes (pipeline §7) before spending on a chain.
-3. `ffmpeg` / `ffprobe`, `jq`, `cwebp` on `$PATH`. Python 3 + Pillow for the knockout
+3. **(Optional) Grok Imagine — the free draft backend.** If `~/.grok/auth.json` exists
+   (the `grok` CLI's login session) or `XAI_API_KEY` is set, the draft pass and,
+   optionally, the stills can render on xAI at no per-clip cost on the subscription
+   (pipeline §1b). Check with one 1k still. A 401 means the session expired: ask the user
+   to run `grok login` (interactive — you can't), and don't run other `grok` subcommands
+   to force a refresh — a failed refresh deletes `auth.json`. Absent → drafts use the
+   480p Replicate previz instead.
+4. `ffmpeg` / `ffprobe`, `jq`, `cwebp` on `$PATH`. Python 3 + Pillow for the knockout
    and the mobile portrait canvases (optional otherwise).
-4. Caveats: macOS ships **bash 3.2** (no `declare -A`), and zsh arrays are 1-indexed —
+5. Caveats: macOS ships **bash 3.2** (no `declare -A`), and zsh arrays are 1-indexed —
    keep chain loops in `#!/bin/bash` scripts. Generations take minutes; always run them
    **in the background** and poll.
 
@@ -114,12 +123,26 @@ own way. Ask only what you can't sensibly default. Cover:
    | Standard 1080p (default) | 0.45 | ≈ $33 | ≈ $22 |
    | 4k | 1.00 | ≈ $73 | ≈ $48 |
 
-   Arch B = N dives × 8 s + (N-1) connectors × 5 s; arch A = N legs × 8 s. **Previz is
-   the default for 5+ scenes**: render the chain at 480p, review the assembled page, then
-   re-render at the final tier — it's the same model, so journey, motion and seams
-   translate. Present the tier choice, state the total including previz and headroom,
-   and get a go. Fewer scenes → raise per-scene `scroll`/`linger` so a short world still
-   reads complete.
+   Arch B = N dives × 8 s + (N-1) connectors × 5 s; arch A = N legs × 8 s.
+
+   **Draft pass — always offered, default for 5+ scenes.** Render the whole chain cheap,
+   wire it into the real page, review, then render the final. Two ways:
+   - **Grok Imagine draft ($0 on the subscription — default when a session exists).**
+     Validates stills, journey, camera moves, copy, pacing and page wiring. It's a
+     different model, so it doesn't preview Seedance's seam character, and it has no
+     end-frame input: arch B connectors only *aim* at the next scene, so their arrival
+     seams pop in the draft (expected; arch A drafts chain cleanly).
+   - **Replicate 480p previz (≈ $4–6 for N=6).** Same model as the final, so it also
+     previews seams. Use when there's no Grok session, or for arch B when the user wants
+     to judge connector seams before paying for 1080p.
+
+   **Stills source**: `gpt-image-2` on Replicate (≈ $0.13 each) or Grok Imagine ($0).
+   One source for all stills of a build — mixing reads as style drift. Grok stills are
+   fine finals; the video model doesn't care where its start image came from.
+
+   Present the tier and draft choice, state the total (draft + final + headroom), and get
+   a go. Fewer scenes → raise per-scene `scroll`/`linger` so a short world still reads
+   complete.
 
 If the user names a video model outside the roster, honor it **only if it can frame-lock
 seams** (Step 4): it must accept a start image, and an end image for connectors. A model
@@ -131,9 +154,10 @@ See `references/prompts.md` for the intake checklist and copy structure.
 
 ## Step 2 — Scene stills (anchor gate, then batch)
 
-One image per section, all sharing the byte-identical style preamble. Model
-`openai/gpt-image-2`, `quality: high`, rendered at **`2048x1152`** — the video's own 16:9
-aspect, so each still is literally frame 0 of the clip it starts.
+One image per section, all sharing the byte-identical style preamble, rendered at the
+video's own aspect (16:9; 9:16 for the mobile chain) so each still is literally frame 0
+of the clip it starts. Source per Step 1.7: `openai/gpt-image-2` (`quality: high`,
+`2048x1152`) or Grok Imagine (`SMODEL=grok`, 2k).
 
 1. **Anchor first.** Generate ONE still (the most representative scene) and show it to
    the user. Iterate the preamble until they approve the art direction. A style miss
@@ -165,6 +189,7 @@ background colour. Keep the solid-bg PNGs — they're the video start images.
 | `bytedance/seedance-2.0` | `image` / `last_frame_image` | **Default** for everything. 480p–4k, 16:9 or 9:16, up to 15 s. `generate_audio` defaults **true** — always send `false`. |
 | `kwaivgi/kling-v3-video` | `start_image` / `end_image` | Moderation fallback for a single stubborn clip (a different content filter). `mode: pro`, audio off. |
 | `bytedance/seedance-2.0-fast` | `image` / `last_frame_image` | Faster turnaround only; 480p/720p, barely cheaper. Not a previz model — previz is seedance-2.0 at 480p. |
+| Grok Imagine `grok-imagine-video-1.5` (xAI, `VMODEL=grok`) | `image` / — | **Draft pass only** (Step 1.7). Start frame locks; no end frame, so it can't make final arch-B connectors. 480p–1080p, 1–15 s. |
 
 Rules:
 - **One model for every chained clip.** Each renderer has its own motion/colour/grain;
@@ -255,7 +280,8 @@ pipeline §4.
    swap on first paint can't pop.
 3. **Seam gate** — SSIM every seam at composition scale (pipeline §5c) before opening a
    browser, and again after every re-roll. Thresholds are provisional until calibrated on
-   a real build.
+   a real build. On a Grok draft, connector→dive seams are expected to fail (no end
+   frame); every other seam should still pass.
 4. **Mobile (opt-in)** — the native 9:16 chain, encoded 720 wide at GOP 4, with its own
    posters and its own seam gate (pipeline §6).
 

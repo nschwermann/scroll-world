@@ -35,6 +35,8 @@ cp -R scroll-world/skills/scroll-world ~/.claude/skills/
 ## Requirements
 
 - A Replicate API token in `REPLICATE_API_TOKEN`, with billing set up.
+- Optional: a Grok session (`grok login` → `~/.grok/auth.json`) or `XAI_API_KEY`, for
+  free drafts and stills on Grok Imagine.
 - `ffmpeg` / `ffprobe`, `jq`, `cwebp`.
 - Python 3 + Pillow (background knockout and mobile portrait canvases; optional).
 
@@ -49,6 +51,8 @@ cp -R scroll-world/skills/scroll-world ~/.claude/skills/
    neighbour's actual rendered frame), a 480p previz pass before the full-resolution
    chain, and `kwaivgi/kling-v3-video` as the fallback for content-filter false
    positives.
+   Optionally, the whole world is **drafted first on Grok Imagine** (xAI) — free on a
+   Grok subscription session — and stills can come from Grok too.
 3. **Verifies and wires it up** — encodes for smooth scrubbing, extracts posters from the
    encoded clips, SSIM-gates every seam, and mounts a config-driven vanilla-JS scrub
    engine (works in plain HTML, Next.js, anything).
@@ -62,7 +66,7 @@ spend ledger.
 
 | Area | oso95 upstream | this fork |
 |---|---|---|
-| Backend | Higgsfield CLI + Monid (+ Codex for stills) | Replicate HTTP API only |
+| Backend | Higgsfield CLI + Monid (+ Codex for stills) | Replicate HTTP API, plus an optional free draft pass on Grok Imagine |
 | Stills | 3:2, re-cropped by the video model | rendered at the video's 16:9 / 9:16 aspect |
 | Spend | estimate + approval | + anchor-still gate, previz by default, idempotent resumable pipeline, spend ledger |
 | Seam QA | eyeball | + automated composition-scale SSIM gate |

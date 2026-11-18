@@ -23,10 +23,13 @@ VRES=1080p                       # 480p = previz, 720p = lean final, 1080p = sta
 ASPECT=16:9                      # 9:16 for the mobile chain (§6)
 DIVE_DUR=8; CONN_DUR=5           # seconds; arch-A legs use DIVE_DUR
 
-# Stills: gpt-image-2 rendered straight at the VIDEO aspect, so the still IS frame 0
-# of the clip it starts (no 3:2 → 16:9 re-crop at the first seam).
-SMODEL=openai/gpt-image-2
-SSIZE=2048x1152                  # 1152x2048 for native portrait stills
+# Stills: rendered straight at the VIDEO aspect, so the still IS frame 0 of the clip
+# it starts (no 3:2 → 16:9 re-crop at the first seam). ONE source for every still.
+SMODEL=openai/gpt-image-2        # or: grok  (Grok Imagine, §1b)
+SSIZE=2048x1152                  # 1152x2048 for native portrait stills (Replicate only)
+
+# DRAFT pass on Grok Imagine (§1b) — same scripts, different backend:
+#   VMODEL=grok VRES=480p        (and SMODEL=grok for the stills, if they're Grok's too)
 ```
 
 ## 1. Replicate helpers
@@ -73,6 +76,7 @@ rate() { # model res → USD per output second (Replicate list price — §8)
     bytedance/seedance-2.0:1080p) echo 0.45 ;; bytedance/seedance-2.0:4k)  echo 1.00 ;;
     bytedance/seedance-2.0-fast:480p) echo 0.07 ;; bytedance/seedance-2.0-fast:720p) echo 0.15 ;;
     kwaivgi/kling-v3-video:*) echo 0.224 ;;    # pro mode, audio off
+    grok:*) echo 0 ;;                          # subscription session (§1b)
     *) echo 0.45 ;;
   esac
 }
@@ -96,6 +100,7 @@ vinput() { # promptFile startUrl endUrl|"" duration outJson
 # One video clip. Idempotent (skips if the output exists); logs spend on success.
 gen_clip() { # label promptFile startPng endPng|"" duration outMp4
   [ -s "$6" ] && { echo "$1 cached"; return 0; }
+  [ "$VMODEL" = grok ] && { grok_clip "$@"; return; }
   local s e=""
   s=$(rep_upload "$3") || { echo "$1 FAIL upload"; return 1; }
   if [ -n "$4" ]; then e=$(rep_upload "$4") || { echo "$1 FAIL upload"; return 1; }; fi
@@ -119,6 +124,95 @@ status() {
 }
 ```
 
+## 1b. Grok Imagine — the free draft backend
+
+xAI's Grok Imagine renders stills and image-to-video on the user's Grok subscription
+session (`grok login` → `~/.grok/auth.json`), or pay-per-use with `XAI_API_KEY`. Use it
+for the **draft pass**: the whole journey rendered at no per-clip cost, wired into the
+real page, reviewed, then re-rendered on Replicate.
+
+What it can and can't do for this skill:
+- **Start frame: yes.** The input image becomes frame 1 — architecture A legs chain
+  exactly as on Replicate.
+- **End frame: no.** There is no last-frame input, so an architecture B connector can
+  only *aim* at the next scene; its arrival seam will pop in the draft. Fine for judging
+  motion and pacing; the SSIM gate will (correctly) flag those seams — ignore them in the
+  draft.
+- **Different model than the final.** A draft validates stills, journey, camera moves,
+  copy, pacing and page wiring — not Seedance's seam character. Run the Replicate
+  qualification probes (§7) before the final, and eyeball its first seams.
+
+```bash
+GROK_API=https://api.x.ai/v1
+GROK_IMG_MODEL=grok-imagine-image-2.0
+GROK_VID_MODEL=grok-imagine-video-1.5
+
+grok_token() {
+  if [ -n "${XAI_API_KEY:-}" ]; then echo "$XAI_API_KEY"
+  else jq -r '[.[]|objects|select(.key)][0].key // empty' ~/.grok/auth.json 2>/dev/null; fi
+}
+grok_datauri() { # image → writes "<image>.duri" (JPEG data URI; inline is how xAI takes images)
+  ffmpeg -v error -y -i "$1" -q:v 2 "$1.grok.jpg"
+  { printf 'data:image/jpeg;base64,'; base64 -i "$1.grok.jpg" | tr -d '\n'; } > "$1.duri"
+}
+grok_post() { # path inJson outJson
+  curl -sS -H "Authorization: Bearer $(grok_token)" -H "Content-Type: application/json" \
+    -d @"$2" "$GROK_API$1" > "$3"
+}
+
+# Still (SMODEL=grok). With STYLE_LOCK set it's an edit seeded by the anchor.
+grok_still() { # name
+  local o="$WORK/still_$1.png"
+  if [ -n "$STYLE_LOCK" ]; then
+    grok_datauri "$STYLE_LOCK"
+    jq -n --rawfile p "$WORK/still_$1.txt" --rawfile u "$STYLE_LOCK.duri" --arg m "$GROK_IMG_MODEL" --arg a "$ASPECT" \
+      '{model:$m, prompt:$p, image:{url:$u, type:"image_url"}, aspect_ratio:$a,
+        resolution:"2k", response_format:"b64_json"}' > "$WORK/still_$1.in.json"
+    grok_post /images/edits "$WORK/still_$1.in.json" "$WORK/still_$1.json"
+  else
+    jq -n --rawfile p "$WORK/still_$1.txt" --arg m "$GROK_IMG_MODEL" --arg a "$ASPECT" \
+      '{model:$m, prompt:$p, n:1, aspect_ratio:$a, resolution:"2k", quality:"medium",
+        response_format:"b64_json"}' > "$WORK/still_$1.in.json"
+    grok_post /images/generations "$WORK/still_$1.in.json" "$WORK/still_$1.json"
+  fi
+  jq -r '.data[0].b64_json // empty' "$WORK/still_$1.json" > "$WORK/still_$1.b64"
+  if [ -s "$WORK/still_$1.b64" ] && base64 -d -i "$WORK/still_$1.b64" -o "$WORK/still_$1.jpg" \
+     && ffmpeg -v error -y -i "$WORK/still_$1.jpg" "$o"; then
+    ledger "still_$1" 0; echo "still $1 ok (grok)"
+  else echo "still $1 FAIL (grok): $(jq -c '.error // .code // .' "$WORK/still_$1.json" | head -c 300)"; fi
+}
+
+# Clip (VMODEL=grok). Same signature as gen_clip; the end frame is ignored (no input for it).
+grok_clip() { # label promptFile startPng endPng|"" duration outMp4
+  local id st k=0
+  [ -n "$4" ] && echo "$1: grok has no end-frame input — arrival seam is approximate (draft only)"
+  grok_datauri "$3"
+  jq -n --rawfile p "$2" --rawfile u "$3.duri" --arg m "$GROK_VID_MODEL" --arg a "$ASPECT" \
+    --arg r "$VRES" --argjson d "$5" \
+    '{model:$m, prompt:$p, image:{url:$u}, duration:$d, aspect_ratio:$a, resolution:$r}' \
+    > "$WORK/$1.in.json"
+  grok_post /videos/generations "$WORK/$1.in.json" "$WORK/$1.start.json"
+  id=$(jq -r '.request_id // empty' "$WORK/$1.start.json")
+  [ -z "$id" ] && { echo "$1 FAIL (grok): $(jq -c . "$WORK/$1.start.json" | head -c 300)"; return 1; }
+  while [ $k -lt 120 ]; do
+    k=$((k+1)); sleep 5
+    curl -sS -H "Authorization: Bearer $(grok_token)" "$GROK_API/videos/$id" > "$WORK/$1.json" || continue
+    st=$(jq -r '.status // empty' "$WORK/$1.json")
+    case "$st" in done|failed|expired) break ;; esac
+  done
+  if [ "$st" = done ] && [ "$(jq -r '.video.respect_moderation' "$WORK/$1.json")" != false ] \
+     && curl -fsSL "$(jq -r '.video.url' "$WORK/$1.json")" -o "$6"; then
+    ledger "$1" 0; echo "$1 ok (grok $VRES ${5}s)"
+  else
+    echo "$1 FAIL (grok ${st:-timeout}): $(jq -c '.error // .video // {}' "$WORK/$1.json" | head -c 300)"; return 1
+  fi
+}
+```
+
+A 401 means the session expired: the user runs `grok login` (interactive — you can't),
+or exports `XAI_API_KEY`. Don't try to refresh the session by running other `grok`
+subcommands; a failed refresh can clear `auth.json`.
+
 **Resume / idempotency.** `$WORK` *is* the run state: every generator skips an output
 that already exists, so a crash, a failed clip, or a moderation re-roll never re-bills
 finished work — just re-run the same loop. To force a re-roll, delete that file first
@@ -135,6 +229,7 @@ STYLE_LOCK=""   # set to the approved anchor PNG after the gate
 gen_still() { # name
   local o="$WORK/still_$1.png" ref="[]"
   [ -s "$o" ] && { echo "still $1 cached"; return 0; }
+  [ "$SMODEL" = grok ] && { grok_still "$1"; return; }
   [ -n "$STYLE_LOCK" ] && ref=$(jq -n --arg u "$(rep_upload "$STYLE_LOCK")" '[$u]')
   jq -n --rawfile p "$WORK/still_$1.txt" --arg a "$SSIZE" --argjson r "$ref" \
     '{prompt:$p, aspect_ratio:$a, quality:"high", background:"opaque", output_format:"png",
@@ -371,11 +466,13 @@ numbers and the date in SKILL Step 4.
   (gotchas.md): `VMODEL=kwaivgi/kling-v3-video; rm "$WORK/conn_3.mp4"; gen_conn 3 …;
   VMODEL=bytedance/seedance-2.0`. Kling's native resolution may differ — encode what
   ffprobe reports.
-- **Previz** = the same model at `VRES=480p` (one model by construction, so seams and
-  motion translate to the final). After approval: `VRES=1080p`, delete the draft clips,
-  frames and their upload caches
+- **Draft → final.** Draft on Grok (`VMODEL=grok VRES=480p`, §1b) when a Grok session
+  exists; otherwise previz on the same Replicate model at `VRES=480p` (the only option
+  that also previews seam character). After approval: `VMODEL=bytedance/seedance-2.0
+  VRES=1080p`, delete the draft clips, frames and their caches
   (`rm -f "$WORK"/{dive,conn,leg}_*.mp4 "$WORK"/{first,last,last_leg}_*.png*`), re-run.
-  Stills are reused. Don't previz on `seedance-2.0-fast` — barely cheaper, and a
-  different model.
+  Approved stills are reused whichever backend made them. Keep the draft's encoded page
+  (copy `$ASSETS` aside) if you want a side-by-side. Don't previz on
+  `seedance-2.0-fast` — barely cheaper, and a different model.
 - Output URLs expire after **1 hour** and uploaded files after ~24 h — the helpers
   download immediately and re-upload when a cache is stale.
