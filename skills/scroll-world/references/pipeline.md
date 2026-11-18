@@ -161,8 +161,13 @@ grok_token() {
   else jq -r '[.[]|objects|select(.key)][0].key // empty' ~/.grok/auth.json 2>/dev/null; fi
 }
 grok_datauri() { # image → writes "<image>.duri" (JPEG data URI; inline is how xAI takes images)
-  ffmpeg -v error -y -i "$1" -q:v 2 "$1.grok.jpg"
-  { printf 'data:image/jpeg;base64,'; base64 -i "$1.grok.jpg" | tr -d '\n'; } > "$1.duri"
+  # Cached, and written via temp files + mv: a style-locked batch runs N of these at once
+  # on the SAME anchor, and a shared temp name hands some of them a half-written image.
+  [ "$1.duri" -nt "$1" ] && return 0
+  local j d; j=$(mktemp "$1.XXXXXX"); d=$(mktemp "$1.XXXXXX")
+  ffmpeg -v error -y -i "$1" -q:v 2 -f mjpeg "$j" \
+    && { printf 'data:image/jpeg;base64,'; base64 -i "$j" | tr -d '\n'; } > "$d" && mv -f "$d" "$1.duri"
+  rm -f "$j" "$d"
 }
 grok_cost() { # json → USD actually billed. The API always reports a list-price cost
   # (usage.cost_in_usd_ticks, 1 USD = 1e10 ticks); a subscription session isn't charged it.
