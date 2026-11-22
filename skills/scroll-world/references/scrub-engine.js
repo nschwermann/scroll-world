@@ -34,7 +34,9 @@
                           // (exactly where the copy peaks) and moves quicker at the
                           // edges. 0 = linear (default). Keep ≤ 0.6; 1 = full pause.
            eyebrow, title, body, tags:[…],
-           cta:{ primary:{label,href}, secondary:{label,href} } }, // last section only
+           note,          // optional small line under the body (a byline)
+           cta:{ primary:{label,href}, secondary:{label,href} },  // any section
+           links:[{label, href?}] },  // optional small text links (no href = plain text)
          …
        ],
        connectors: [clipUrl, …],          // length = sections.length - 1 (nulls allowed)
@@ -118,8 +120,19 @@ function mountScrollWorld(container, config) {
   const DIVE_W = config.diveScroll || 1.3;
   const CONN_W = config.connScroll || 0.9;
   const CROSSFADE = (config.crossfade != null) ? config.crossfade : 0.12;  // seam dissolve width (vh)
+  // KEYFRAMED chains (each clip starts on its scene's still and ends on the next one's,
+  // e.g. Seedance first+last frame): the scene's painting is at the START of its clip.
+  // Video time tracks scroll linearly, so the film moves at one steady rate; the copy
+  // fades in as the previous clip arrives, stays put for `hold` of the clip's scroll
+  // while the film keeps playing behind it, then fades before the next scene lands.
+  // `rest: true` brings back the old map (camera nearly parked for `hold`, then an
+  // eased flight), which reads as "stalls, then races" when scrubbed.
+  const KEYFRAMED = !!config.keyframed;
+  const HOLD = (config.hold != null) ? config.hold : 0.4;
+  const REST = !!config.rest;
+  const HOLD_DRIFT = 0.04;   // rest mode: fraction of the clip the camera creeps through while holding
   const N = SECTIONS.length;
-  if (!N) return;
+  if (!N) return null;
 
   injectCSS();
   container.classList.add('sw-root');
@@ -132,7 +145,8 @@ function mountScrollWorld(container, config) {
   SECTIONS.forEach((s, i) => {
     const dive = { kind: 'dive', si: i, clip: s.clip, clipM: s.clipMobile, still: s.still,
                    poster: s.poster, posterM: s.posterMobile || s.stillMobile,
-                   accent: s.accent, w: s.scroll || DIVE_W, linger: s.linger || 0 };
+                   accent: s.accent, w: s.scroll || DIVE_W, linger: s.linger || 0,
+                   hold: (s.hold != null) ? s.hold : HOLD };
     SEGMENTS.push(dive);
     s._seg = dive;
     // A connector is optional: if connectors[i] is falsy, the two dives simply
@@ -208,8 +222,11 @@ function mountScrollWorld(container, config) {
       (s.eyebrow ? `<span class="sw-copy__eyebrow">${esc(s.eyebrow)}</span>` : '') +
       (s.title ? `<h2 class="sw-copy__title">${esc(s.title)}</h2>` : '') +
       (s.body ? `<p class="sw-copy__body">${esc(s.body)}</p>` : '') +
+      (s.note ? `<p class="sw-copy__note">${esc(s.note)}</p>` : '') +
       (s.tags && s.tags.length ? `<ul class="sw-copy__tags">${s.tags.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : '') +
-      (s.cta ? `<div class="sw-copy__cta">${ctaBtns(s.cta)}</div>` : '');
+      (s.cta ? `<div class="sw-copy__cta">${ctaBtns(s.cta)}</div>` : '') +
+      (s.links && s.links.length ? `<p class="sw-copy__links">${s.links.map(l => l.href
+        ? `<a href="${esc(l.href)}"${ext(l.href)}>${esc(l.label)}</a>` : `<span>${esc(l.label)}</span>`).join('')}</p>` : '');
     copylayer.appendChild(c); copies.push(c);
 
     const dot = el('button', 'sw-route__dot'); dot.style.setProperty('--sw-accent', s.accent || '');
@@ -249,7 +266,17 @@ function mountScrollWorld(container, config) {
 
   function jumpTo(i) {
     const seg = SECTIONS[i]._seg;
-    window.scrollTo({ top: seg.start + (seg.end - seg.start) * 0.5, behavior: reduce ? 'auto' : 'smooth' });
+    const len = seg.end - seg.start;
+    let top = seg.start + len * 0.5;
+    // Keyframed: land on the scene's own painting (clip frame 0), copy fully up.
+    if (KEYFRAMED) top = (i === N - 1) ? seg.end : i === 0 ? 0 : seg.start + len * (REST ? seg.hold * 0.5 : 0.01);
+    window.scrollTo({ top, behavior: reduce ? 'auto' : 'smooth' });
+  }
+  // Keyframed time map: rest near frame 0 for the hold, then an eased flight to the end.
+  function keyTime(x, h) {
+    if (!REST) return x;
+    if (x <= h) return h > 0 ? (x / h) * HOLD_DRIFT : 0;
+    return HOLD_DRIFT + (1 - HOLD_DRIFT) * smooth((x - h) / (1 - h));
   }
 
   function enterStillsMode() {
@@ -275,6 +302,7 @@ function mountScrollWorld(container, config) {
     const url = (phoneClass && s.clipM) ? s.clipM : s.clip;
     fetch(url).then(r => r.ok ? r.blob() : Promise.reject(new Error('404')))
       .then(blob => {
+        if (!alive) return;   // unmounted while the clip was downloading
         const v = document.createElement('video');
         v.className = 'sw-scene__video';
         v.muted = true; v.playsInline = true; v.preload = 'auto';
@@ -292,7 +320,8 @@ function mountScrollWorld(container, config) {
 
   function read() {
     const y = window.scrollY || window.pageYOffset;
-    const fade = CROSSFADE * vh;
+    // Stills mode has no motion to carry a seam, so it always gets a real dissolve.
+    const fade = (stillsOnly ? Math.max(CROSSFADE, 0.35) : CROSSFADE) * vh;
     let ci = 0;
     for (let i = 0; i < NSEG; i++) if (y >= SEGMENTS[i].start) ci = i;
 
@@ -303,13 +332,18 @@ function mountScrollWorld(container, config) {
       const s = SEGMENTS[i];
       if (y > s.start - lookahead * vh && y < s.end + lookahead * vh) loadClip(s);
       const local = clamp((y - s.start) / (s.end - s.start), 0, 1);
-      s.target = s.linger ? lingerEase(local, s.linger) : local;
+      s.target = KEYFRAMED ? keyTime(local, s.hold) : (s.linger ? lingerEase(local, s.linger) : local);
       let outside = 0;
-      if (y < s.start) outside = s.start - y; else if (y > s.end) outside = y - s.end;
+      // The first scene stays up above its start and the last below its end, so the
+      // page top and bottom (incl. any footer after the film) rest on a real frame.
+      if (y < s.start && i > 0) outside = s.start - y;
+      else if (y > s.end && i < NSEG - 1) outside = y - s.end;
       const op = smooth(1 - outside / fade);
       s.el.style.opacity = op; s.visible = op > 0.001;
       s.el.style.zIndex = (i === ci) ? '120' : String(100 + Math.round(op * 10));
-      if (!s.hasClip || !s.ready) {
+      if (KEYFRAMED) {
+        s.img.style.transform = 'none';   // poster == clip frame 0: no zoom, so no pop on swap
+      } else if (!s.hasClip || !s.ready) {
         const sc = reduce ? 1 : 1.03 + local * 0.14;
         s.img.style.transform = `translateX(${stageX - 2}vw) scale(${sc.toFixed(3)})`;
       }
@@ -320,17 +354,34 @@ function mountScrollWorld(container, config) {
       const pr = clamp((y - seg.start) / (seg.end - seg.start), 0, 1);
       const before = y < seg.start, after = y > seg.end;
       let cop;
-      if (i === 0) cop = after ? 0 : smooth(1 - pr / 0.62);            // greets on landing
+      if (KEYFRAMED) {
+        // In: as the previous clip lands on this scene. Hold: through this scene's rest.
+        // Out: early in the flight away. The last scene never fades out.
+        if (before) {
+          const p = i > 0 ? SECTIONS[i - 1]._seg : null;
+          cop = p ? smooth((clamp((y - p.start) / (p.end - p.start), 0, 1) - 0.86) / 0.12) : 1;
+        } else if (i === N - 1) cop = 1;
+        else cop = smooth(1 - (pr - seg.hold) / 0.1);
+      }
+      else if (i === 0) cop = after ? 0 : smooth(1 - pr / 0.62);       // greets on landing
       else if (i === N - 1) cop = before ? 0 : smooth(pr / 0.4);       // holds CTA at the end
       else cop = (before || after) ? 0 : smooth(1 - Math.abs(pr - 0.5) / 0.5);
       const c = copies[i];
       c.style.opacity = cop;
-      c.style.transform = reduce ? 'none' : `translateY(${(0.5 - pr) * 4}vh)`;
+      // Drift goes through a CSS variable so it composes with the layout transform
+      // (desktop centres the copy with translateY(-50%); an inline transform would
+      // replace that and push the copy, and its buttons, below the fold).
+      c.style.setProperty('--sw-dy', reduce ? '0px'
+        : KEYFRAMED ? `${((1 - cop) * 2).toFixed(2)}vh` : `${((0.5 - pr) * 4).toFixed(2)}vh`);
+      // Only the visible scene's copy takes clicks (its CTAs inherit this), and fully
+      // faded copy leaves the accessibility tree / tab order.
       c.style.pointerEvents = cop > 0.5 ? 'auto' : 'none';
+      c.style.visibility = cop < 0.01 ? 'hidden' : '';
     }
 
     const cur = SEGMENTS[ci];
-    const near = clamp(cur.kind === 'dive' ? cur.si
+    const curPr = clamp((y - cur.start) / (cur.end - cur.start), 0, 1);
+    const near = KEYFRAMED ? clamp(curPr > 0.92 ? cur.si + 1 : cur.si, 0, N - 1) : clamp(cur.kind === 'dive' ? cur.si
       : (((y - cur.start) / (cur.end - cur.start)) > 0.5 ? cur.si + 1 : cur.si), 0, N - 1);
     if (near !== activeIndex) {
       activeIndex = near;
@@ -344,7 +395,9 @@ function mountScrollWorld(container, config) {
     ticking = false;
   }
 
+  let alive = true;
   function raf() {
+    if (!alive) return;
     const eps = isMobile() ? 0.02 : 0.008;   // coarser seek step on phones = fewer decodes
     for (let i = 0; i < NSEG; i++) {
       const s = SEGMENTS[i];
@@ -386,7 +439,8 @@ function mountScrollWorld(container, config) {
 
   // Particles are a per-frame cost we can't afford alongside video scrubbing on a phone.
   seedParticles(particles, reduce || coarse);
-  window.addEventListener('scroll', () => { if (!ticking) { ticking = true; requestAnimationFrame(read); } }, { passive: true });
+  function onScroll() { if (!ticking) { ticking = true; requestAnimationFrame(() => { if (alive) read(); }); } }
+  window.addEventListener('scroll', onScroll, { passive: true });
   // Mobile browsers fire `resize` every time the URL bar slides in/out. Re-running
   // layout() there rebuilds the track height and yanks the scroll position, so on
   // touch we ignore height-only changes and only relayout when the width actually
@@ -402,14 +456,38 @@ function mountScrollWorld(container, config) {
   layout();
   requestAnimationFrame(raf);
 
+  // Handle for host frameworks: jumpTo(i) scrolls to section i (e.g. a "Contact" link
+  // to the finale); destroy() tears everything down (React unmount / Strict Mode).
+  return {
+    jumpTo,
+    destroy() {
+      alive = false;
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', layout);
+      window.removeEventListener('load', layout);
+      window.removeEventListener('pointerdown', onFirstGesture);
+      window.removeEventListener('touchstart', onFirstGesture);
+      SEGMENTS.forEach(s => {
+        if (s.video) { try { s.video.pause(); } catch (e) {} try { URL.revokeObjectURL(s.video.src); } catch (e) {} }
+      });
+      [sky, scrollbar, topbar, stage, copylayer, route, hint, track].forEach(n => n.remove());
+      container.querySelectorAll('[data-sw-seo]').forEach(n => { n.hidden = false; });
+      container.classList.remove('sw-root');
+    },
+  };
+
   // ---- helpers ----
   function el(tag, cls) { const n = document.createElement(tag); if (cls) n.className = cls; return n; }
   function pad(n) { return String(n).padStart(2, '0'); }
   function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  // External links open in a new tab; same-site and mailto links don't.
+  // External links and PDFs (e.g. a résumé) open in a new tab.
+  function ext(href) { return /^https?:\/\/|\.pdf(?:$|[?#])/i.test(href || '') ? ' target="_blank" rel="noopener"' : ''; }
   function ctaBtns(cta) {
     let h = '';
-    if (cta.primary) h += `<a class="sw-btn sw-btn--primary" href="${esc(cta.primary.href || '#')}">${esc(cta.primary.label)}</a>`;
-    if (cta.secondary) h += `<a class="sw-btn sw-btn--ghost" href="${esc(cta.secondary.href || '#')}">${esc(cta.secondary.label)}</a>`;
+    if (cta.primary) h += `<a class="sw-btn sw-btn--primary" href="${esc(cta.primary.href || '#')}"${ext(cta.primary.href)}>${esc(cta.primary.label)}</a>`;
+    if (cta.secondary) h += `<a class="sw-btn sw-btn--ghost" href="${esc(cta.secondary.href || '#')}"${ext(cta.secondary.href)}>${esc(cta.secondary.label)}</a>`;
     return h;
   }
 }
@@ -464,14 +542,18 @@ function injectCSS() {
   .sw-scene__still{will-change:transform;} .sw-scene.has-clip .sw-scene__still{opacity:0;} .sw-scene__video{z-index:1;}
   .sw-copylayer{position:fixed;inset:0;z-index:20;pointer-events:none;}
   .sw-copylayer::before{content:"";position:absolute;inset:0;width:min(58vw,780px);background:linear-gradient(90deg,var(--sw-bg) 0%,color-mix(in srgb,var(--sw-bg) 82%,transparent) 34%,color-mix(in srgb,var(--sw-bg) 40%,transparent) 62%,transparent 100%);}
-  .sw-copy{position:absolute;left:clamp(18px,5vw,64px);top:50%;transform:translateY(-50%);width:min(42vw,460px);opacity:0;will-change:opacity,transform;}
+  .sw-copy{position:absolute;left:clamp(18px,5vw,64px);top:50%;transform:translateY(calc(-50% + var(--sw-dy,0px)));max-height:calc(100vh - 140px);width:min(42vw,460px);opacity:0;will-change:opacity,transform;}
   .sw-copy__num{font-family:ui-monospace,Menlo,monospace;font-size:.74rem;letter-spacing:.12em;color:var(--sw-ink-soft);}
   .sw-copy__eyebrow{display:block;margin-top:18px;font-family:var(--sw-font-display);font-weight:700;font-size:.8rem;letter-spacing:.16em;text-transform:uppercase;color:var(--sw-accent);}
   .sw-copy__title{font-family:var(--sw-font-display);font-weight:700;color:var(--sw-ink);font-size:clamp(2rem,4.4vw,3.5rem);line-height:1.03;margin:12px 0 0;letter-spacing:-.01em;text-shadow:0 2px 20px color-mix(in srgb,var(--sw-bg) 70%,transparent);}
   .sw-copy__body{margin-top:18px;font-size:clamp(1rem,1.25vw,1.14rem);line-height:1.55;color:color-mix(in srgb,var(--sw-ink) 78%,var(--sw-ink-soft));max-width:40ch;text-shadow:0 1px 12px color-mix(in srgb,var(--sw-bg) 90%,transparent);}
   .sw-copy__tags{list-style:none;display:flex;flex-wrap:wrap;gap:8px;margin:24px 0 0;padding:0;}
   .sw-copy__tags li{font-size:.82rem;font-weight:600;color:color-mix(in srgb,var(--sw-accent) 70%,#000);padding:7px 14px;border-radius:999px;background:color-mix(in srgb,var(--sw-accent) 14%,#fff);border:1px solid color-mix(in srgb,var(--sw-accent) 30%,transparent);}
-  .sw-copy__cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px;pointer-events:auto;}
+  .sw-copy__note{margin-top:14px;font-size:.86rem;letter-spacing:.02em;color:var(--sw-ink-soft);}
+  .sw-copy__links{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:18px;font-size:.86rem;pointer-events:inherit;color:var(--sw-ink-soft);}
+  .sw-copy__links a{color:var(--sw-ink-soft);text-decoration:underline;text-underline-offset:3px;text-decoration-color:color-mix(in srgb,var(--sw-accent) 50%,transparent);}
+  .sw-copy__links a:hover{color:var(--sw-ink);}
+  .sw-copy__cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px;pointer-events:inherit;}
   .sw-btn{text-decoration:none;font-weight:600;font-size:.95rem;padding:13px 24px;border-radius:999px;transition:transform .2s;}
   .sw-btn--primary{color:#fff;background:var(--sw-ink);} .sw-btn--primary:hover{transform:translateY(-2px);}
   .sw-btn--ghost{color:var(--sw-ink);border:1.5px solid color-mix(in srgb,var(--sw-ink) 25%,transparent);} .sw-btn--ghost:hover{transform:translateY(-2px);}
@@ -493,7 +575,7 @@ function injectCSS() {
     .sw-copylayer::before{width:100%;height:60%;top:auto;bottom:0;background:linear-gradient(0deg,var(--sw-bg) 8%,color-mix(in srgb,var(--sw-bg) 70%,transparent) 46%,transparent 100%);}
     /* Anchor copy to the bottom, clear of the home indicator / collapsing URL bar.
        dvh + env() are progressive: browsers that lack them keep the vh fallback line. */
-    .sw-copy{left:clamp(18px,5vw,64px);right:clamp(18px,5vw,64px);top:auto;bottom:clamp(64px,14vh,120px);transform:none;width:auto;max-width:560px;}
+    .sw-copy{left:clamp(18px,5vw,64px);right:clamp(18px,5vw,64px);top:auto;bottom:clamp(64px,14vh,120px);transform:translateY(var(--sw-dy,0px));width:auto;max-width:560px;}
     .sw-copy{bottom:calc(clamp(56px,12dvh,110px) + env(safe-area-inset-bottom));}
     .sw-copy__title{font-size:clamp(1.9rem,7.5vw,2.7rem);}
     .sw-copy__body{max-width:none;font-size:clamp(.98rem,3.6vw,1.1rem);} .sw-scene__video,.sw-scene__still{object-position:center 46%;}
