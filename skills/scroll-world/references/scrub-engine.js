@@ -311,12 +311,11 @@ function mountScrollWorld(container, config) {
         // Prime on metadata, not loadeddata: iOS never fires loadeddata for a video that
         // hasn't played, so clips that arrive after the first touch would never be primed
         // and would stay blank (the poster shows through). Muted inline play() needs no gesture.
-        v.addEventListener('loadedmetadata', () => { s.ready = true; if (userReady) primeVideo(v); read(); });
+        v.addEventListener('loadedmetadata', () => { s.ready = true; if (userReady) primeVideo(v, false); read(); });
         // Reveal the video (hide the still poster) only once a real frame has
         // painted — on iOS a seeked-but-never-played muted video stays blank, so
         // hiding the still on metadata alone would flash an empty scene.
         v.addEventListener('seeked', () => { s.el.classList.add('has-clip'); }, { once: true });
-        v.addEventListener('loadeddata', () => { try { v.pause(); } catch (e) {} });
         s.el.appendChild(v); s.video = v; s.hasClip = true;
       }).catch(() => { s.loading = false; });
   }
@@ -418,27 +417,34 @@ function mountScrollWorld(container, config) {
     requestAnimationFrame(raf);
   }
 
-  // iOS needs a user gesture before a muted video will decode/paint reliably. On the
-  // first touch we prime every loaded clip (muted play→pause) so the first seek is
-  // instant instead of showing a blank frame. `userReady` also makes freshly-loaded
-  // clips prime themselves (see loadClip).
+  // iOS won't paint a muted video that has never played, so each clip is "primed"
+  // (muted play→pause) once. Clips loaded before the first touch are primed by that
+  // touch; clips that arrive later prime on metadata (muted inline play needs no
+  // gesture), and any that still haven't played are retried on every later touch.
   let userReady = false;
-  function primeVideo(v) {
-    if (!isMobile() || !v) return;
-    // A muted, playsinline play() that REJECTS on a user gesture means the OS is
-    // blocking video — in practice iOS Low Power Mode, where currentTime scrubbing
-    // doesn't work either. Fall back to stills for the whole page instead of showing
-    // frozen/blank scenes.
-    try { const p = v.play(); if (p && p.then) p.then(() => { try { v.pause(); } catch (e) {} }).catch(() => { enterStillsMode(); }); }
-    catch (e) {}
+  function primeVideo(v, fromGesture) {
+    if (!isMobile() || !v || v._primed || v._priming) return;
+    v._priming = true;
+    try {
+      const p = v.play();
+      if (!p || !p.then) { v._priming = false; return; }
+      p.then(() => { v._primed = true; v._priming = false; try { v.pause(); } catch (e) {} })
+       .catch(err => {
+         v._priming = false;
+         // Only a play() REFUSED during a real touch means the OS is blocking video
+         // (iOS Low Power Mode, where scrubbing fails too) → stills for the whole page.
+         // An AbortError (play interrupted) or a refusal outside a gesture just waits
+         // for the next touch.
+         if (fromGesture && err && err.name === 'NotAllowedError') enterStillsMode();
+       });
+    } catch (e) { v._priming = false; }
   }
   function onFirstGesture() {
-    if (userReady) return;
     userReady = true;
-    SEGMENTS.forEach(s => primeVideo(s.video));
+    SEGMENTS.forEach(s => primeVideo(s.video, true));
   }
-  window.addEventListener('pointerdown', onFirstGesture, { once: true, passive: true });
-  window.addEventListener('touchstart', onFirstGesture, { once: true, passive: true });
+  window.addEventListener('pointerdown', onFirstGesture, { passive: true });
+  window.addEventListener('touchstart', onFirstGesture, { passive: true });
 
   // Particles are a per-frame cost we can't afford alongside video scrubbing on a phone.
   seedParticles(particles, reduce || coarse);
